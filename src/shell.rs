@@ -2,11 +2,13 @@ use errno::errno;
 use libc;
 use std::collections::HashMap;
 use std::env;
+use std::io::Write;
 use std::mem;
 
 use glob;
 use regex::Regex;
 
+use execute;
 use parsers;
 use tools::{self, clog};
 
@@ -129,6 +131,68 @@ fn needs_globbing(line: &str) -> bool {
     false
 }
 
+pub fn expand_glob(tokens: &mut Vec<(String, String)>) {
+    let mut idx: usize = 0;
+
+    let mut buff: HashMap<usize, String> = HashMap::new();
+    for (sep, text) in tokens.iter() {
+        if !sep.is_empty() || !needs_globbing(text) {
+            idx += 1;
+            continue;
+        }
+
+        let _line = text.to_string();
+        // XXX: spliting needs to consider cases like `echo 'a * b'`
+        let _tokens: Vec<&str> = _line.split(' ').collect();
+        let mut result: Vec<String> = Vec::new();
+        for item in &_tokens {
+            if !item.contains('*') || item.trim().starts_with('\'') || item.trim().starts_with('"') {
+                result.push(item.to_string());
+            } else {
+                match glob::glob(item) {
+                    Ok(paths) => {
+                        let mut is_empty = true;
+                        for entry in paths {
+                            match entry {
+                                Ok(path) => {
+                                    let s = path.to_string_lossy();
+                                    if !item.starts_with('.') && s.starts_with('.') && !s.contains('/')
+                                    {
+                                        // skip hidden files, you may need to
+                                        // type `ls .*rc` instead of `ls *rc`
+                                        continue;
+                                    }
+                                    result.push(tools::wrap_sep_string("", &s));
+                                    is_empty = false;
+                                }
+                                Err(e) => {
+                                    log!("glob error: {:?}", e);
+                                }
+                            }
+                        }
+                        if is_empty {
+                            result.push(item.to_string());
+                        }
+                    }
+                    Err(e) => {
+                        println!("glob error: {:?}", e);
+                        result.push(item.to_string());
+                        return;
+                    }
+                }
+            }
+        }
+        // *line = result.join(" ");
+
+        buff.insert(idx, result.join(" "));
+        idx += 1;
+    }
+
+    for (i, text) in buff.iter() {
+        tokens[*i as usize].1 = text.to_string();
+    }
+}
+
 pub fn extend_glob(line: &mut String) {
     if !needs_globbing(&line) {
         return;
@@ -244,17 +308,208 @@ pub fn extend_env(sh: &Shell, line: &mut String) {
     *line = result.join(" ");
 }
 
+fn expand_brace(tokens: &mut Vec<(String, String)>) {
+    let mut idx: usize = 0;
+    let mut buff: HashMap<usize, String> = HashMap::new();
+    for (sep, line) in tokens.iter() {
+        if !sep.is_empty() || !tools::should_extend_brace(&line) {
+            idx += 1;
+            continue;
+        }
+
+        let _line = line.clone();
+        let args = parsers::parser_line::cmd_to_tokens(_line.as_str());
+        let mut result: Vec<String> = Vec::new();
+        for (sep, token) in args {
+            if sep.is_empty() && tools::should_extend_brace(token.as_str()) {
+                let mut _prefix = String::new();
+                let mut _token = String::new();
+                let mut _result = Vec::new();
+                let mut only_tail_left = false;
+                let mut start_sign_found = false;
+                for c in token.chars() {
+                    if c == '{' {
+                        start_sign_found = true;
+                        continue;
+                    }
+                    if !start_sign_found {
+                        _prefix.push(c);
+                        continue;
+                    }
+                    if only_tail_left {
+                        _token.push(c);
+                        continue;
+                    }
+                    if c == '}' {
+                        if !_token.is_empty() {
+                            _result.push(_token);
+                            _token = String::new();
+                        }
+                        only_tail_left = true;
+                        continue;
+                    }
+                    if c == ',' {
+                        if !_token.is_empty() {
+                            _result.push(_token);
+                            _token = String::new();
+                        }
+                    } else {
+                        _token.push(c);
+                    }
+                }
+                for item in &mut _result {
+                    *item = format!("{}{}{}", _prefix, item, _token);
+                }
+                result.push(_result.join(" "));
+            } else {
+                result.push(tools::wrap_sep_string(&sep, &token));
+            }
+        }
+
+        buff.insert(idx, result.join(" "));
+        idx += 1;
+    }
+
+    for (i, text) in buff.iter() {
+        tokens[*i as usize].1 = text.to_string();
+    }
+}
+
+pub fn expand_home_string(text: &mut String) {
+    // let mut s: String = String::from(text);
+    let v = vec![
+        r"(?P<head> +)~(?P<tail> +)",
+        r"(?P<head> +)~(?P<tail>/)",
+        r"^(?P<head> *)~(?P<tail>/)",
+        r"(?P<head> +)~(?P<tail> *$)",
+    ];
+    for item in &v {
+        let re;
+        if let Ok(x) = Regex::new(item) {
+            re = x;
+        } else {
+            return;
+        }
+        let home = tools::get_user_home();
+        let ss = text.clone();
+        let to = format!("$head{}$tail", home);
+        let result = re.replace_all(ss.as_str(), to.as_str());
+        *text = result.to_string();
+    }
+}
+
+fn expand_home(tokens: &mut Vec<(String, String)>) {
+    let mut idx: usize = 0;
+
+    let mut buff: HashMap<usize, String> = HashMap::new();
+    for (sep, text) in tokens.iter() {
+        if !sep.is_empty() || !needs_expand_home(&text) {
+            idx += 1;
+            continue;
+        }
+
+        let mut s: String = text.clone();
+        let v = vec![
+            r"(?P<head> +)~(?P<tail> +)",
+            r"(?P<head> +)~(?P<tail>/)",
+            r"^(?P<head> *)~(?P<tail>/)",
+            r"(?P<head> +)~(?P<tail> *$)",
+        ];
+        for item in &v {
+            let re;
+            if let Ok(x) = Regex::new(item) {
+                re = x;
+            } else {
+                return;
+            }
+            let home = tools::get_user_home();
+            let ss = s.clone();
+            let to = format!("$head{}$tail", home);
+            let result = re.replace_all(ss.as_str(), to.as_str());
+            s = result.to_string();
+        }
+        buff.insert(idx, s.clone());
+        idx += 1;
+    }
+
+    for (i, text) in buff.iter() {
+        tokens[*i as usize].1 = text.to_string();
+    }
+}
+
+fn expand_env(sh: &Shell, tokens: &mut Vec<(String, String)>) {
+    let mut idx: usize = 0;
+    let mut buff: HashMap<usize, String> = HashMap::new();
+
+    for (sep, line) in tokens.iter() {
+        if sep == "`" || sep == "'" {
+            idx += 1;
+            continue;
+        }
+
+        let _token = extend_env_blindly(sh, line);
+        buff.insert(idx, _token);
+        idx += 1;
+    }
+
+    for (i, text) in buff.iter() {
+        tokens[*i as usize].1 = text.to_string();
+    }
+}
+
+fn should_do_dollar_command_extension(line: &str) -> bool {
+    tools::re_contains(line, r"\$\([^\)]+\)")
+}
+
+fn should_do_dot_command_extension(line: &str) -> bool {
+    tools::re_contains(line, r"`[^`]+`")
+}
+
+
+fn do_command_substitution(tokens: &mut Vec<(String, String)>) {
+    do_command_substitution_for_dot(tokens);
+    do_command_substitution_for_dollar(tokens);
+}
+
+pub fn do_expansion(sh: &Shell, tokens: &mut Vec<(String, String)>) {
+    expand_home(tokens);
+    expand_brace(tokens);
+    expand_env(sh, tokens);
+    expand_glob(tokens);
+    do_command_substitution(tokens);
+}
+
+pub fn needs_expand_home(line: &str) -> bool {
+    tools::re_contains(line, r"( +~ +)|( +~/)|(^ *~/)|( +~ *$)")
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, File};
+    use stl::fs::{self, File};
 
     use super::extend_env;
     use super::extend_glob;
+    use super::needs_expand_home;
     use super::needs_globbing;
     use super::Shell;
+    use super::should_do_dollar_command_extension;
+
+    #[test]
+    fn test_need_expand_home() {
+        assert!(needs_expand_home("ls ~"));
+        assert!(needs_expand_home("ls  ~  "));
+        assert!(needs_expand_home("cat ~/a.py"));
+        assert!(needs_expand_home("echo ~"));
+        assert!(needs_expand_home("echo ~ ~~"));
+        assert!(needs_expand_home("~/bin/py"));
+        assert!(!needs_expand_home("echo '~'"));
+        assert!(!needs_expand_home("echo \"~\""));
+        assert!(!needs_expand_home("echo ~~"));
+    }
 
     #[test]
     fn test_needs_globbing() {
+        assert!(needs_globbing("*"));
         assert!(needs_globbing("ls *"));
         assert!(needs_globbing("ls  *.txt"));
         assert!(needs_globbing("grep -i 'desc' /etc/*release*"));
@@ -320,5 +575,16 @@ mod tests {
         line = String::from("echo \'*\'");
         extend_glob(&mut line);
         assert_eq!(line, "echo \'*\'");
+    }
+
+    #[test]
+    fn test_should_do_dollar_command_extension() {
+        assert!(!should_do_dollar_command_extension("ls $HOME"));
+        assert!(!should_do_dollar_command_extension("echo $[pwd]"));
+        assert!(should_do_dollar_command_extension("echo $(pwd)"));
+        assert!(should_do_dollar_command_extension("echo $(pwd) foo"));
+        assert!(should_do_dollar_command_extension("echo $(foo bar)"));
+        assert!(should_do_dollar_command_extension("echo $(echo foo)"));
+        assert!(should_do_dollar_command_extension("$(pwd) foo"));
     }
 }

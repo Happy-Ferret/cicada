@@ -117,7 +117,6 @@ pub fn run_procs(sh: &mut shell::Shell, line: &str, tty: bool) -> i32 {
             break;
         }
         let mut cmd = token.clone();
-        tools::pre_handle_cmd_line(&sh, &mut cmd);
         status = run_proc(sh, &cmd, tty);
     }
     status
@@ -157,7 +156,12 @@ fn drain_env_tokens(tokens: &mut Vec<(String, String)>) -> HashMap<String, Strin
 
 pub fn run_proc(sh: &mut shell::Shell, line: &str, tty: bool) -> i32 {
     let mut tokens = parsers::parser_line::cmd_to_tokens(line);
+    // tools::pre_handle_cmd_line(&sh, &mut cmd);
+    log!("tokens 1: {:?}", tokens);
+    shell::do_expansion(sh, &mut tokens);
+    log!("tokens 2: {:?}", tokens);
     let envs = drain_env_tokens(&mut tokens);
+    log!("tokens 3: {:?}", tokens);
 
     if tokens.is_empty() {
         for (name, value) in envs.iter() {
@@ -172,7 +176,7 @@ pub fn run_proc(sh: &mut shell::Shell, line: &str, tty: bool) -> i32 {
         return builtins::cd::run(sh, &tokens);
     }
     if cmd == "export" {
-        return builtins::export::run(sh, line);
+        return builtins::export::run(sh, &tokens);
     }
     if cmd == "vox" {
         return builtins::vox::run(sh, &tokens);
