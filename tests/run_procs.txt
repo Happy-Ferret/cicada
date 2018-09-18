@@ -139,3 +139,9 @@ echo $FOO  # the above inline env settings won't change the shell variable
 rm -f foo.sh  # clean up
 
 
+echo `echo foo bar | awk '{print $2, $1}'`
+^bar foo$
+
+echo A`echo foo bar | awk '{print $2, $1}'`B
+^Abar fooB$
+

@@ -461,10 +461,95 @@ fn should_do_dollar_command_extension(line: &str) -> bool {
     tools::re_contains(line, r"\$\([^\)]+\)")
 }
 
-fn should_do_dot_command_extension(line: &str) -> bool {
-    tools::re_contains(line, r"`[^`]+`")
+fn do_command_substitution_for_dollar(tokens: &mut Vec<(String, String)>) {
 }
 
+fn do_command_substitution_for_dot(tokens: &mut Vec<(String, String)>) {
+    let mut idx: usize = 0;
+    let mut buff: HashMap<usize, String> = HashMap::new();
+    for (sep, token) in tokens.iter() {
+        let new_token: String;
+        if sep == "`" {
+            let _args = parsers::parser_line::cmd_to_tokens(token.as_str());
+            let (_, _, output) = execute::run_pipeline(_args, "", false, false, true, false, None);
+            if let Some(x) = output {
+                match String::from_utf8(x.stdout) {
+                    Ok(stdout) => {
+                        new_token = String::from(stdout.trim());
+                    }
+                    Err(_) => {
+                        println_stderr!("cicada: from_utf8 error");
+                        idx += 1; continue;
+                    }
+                }
+            } else {
+                println_stderr!("cicada: command error");
+                idx += 1; continue;
+            }
+        } else if sep == "\"" || sep.is_empty() {
+            let re;
+            if let Ok(x) = Regex::new(r"^([^`]*)`([^`]+)`(.*)$") {
+                re = x;
+            } else {
+                println_stderr!("cicada: re new error");
+                return;
+            }
+            if !re.is_match(&token) {
+                idx += 1; continue;
+            }
+            let mut _token = token.clone();
+            let mut _item = String::new();
+            let mut _head = String::new();
+            let mut _output = String::new();
+            let mut _tail = String::new();
+            loop {
+                if !re.is_match(&_token) {
+                    if !_token.is_empty() {
+                        _item = format!("{}{}", _item, _token);
+                    }
+                    break;
+                }
+                for cap in re.captures_iter(&_token) {
+                    _head = cap[1].to_string();
+                    _tail = cap[3].to_string();
+                    let _args = parsers::parser_line::cmd_to_tokens(&cap[2]);
+                    let (_, _, output) =
+                        execute::run_pipeline(_args, "", false, false, true, false, None);
+                    if let Some(x) = output {
+                        match String::from_utf8(x.stdout) {
+                            Ok(stdout) => {
+                                _output = stdout.trim().to_string();
+                            }
+                            Err(_) => {
+                                println_stderr!("cicada: from_utf8 error");
+                                return;
+                            }
+                        }
+                    } else {
+                        println_stderr!("cicada: command error: {}", token);
+                        return;
+                    }
+                }
+                _item = format!("{}{}{}", _item, _head, _output);
+                if _tail.is_empty() {
+                    break;
+                }
+                _token = _tail.clone();
+            }
+            new_token = String::from(_item);
+        } else {
+            idx += 1;
+            continue;
+        }
+
+        buff.insert(idx, new_token.clone());
+        idx += 1;
+    }
+
+    for (i, text) in buff.iter() {
+        tokens[*i as usize].1 = text.to_string();
+    }
+}
 
 fn do_command_substitution(tokens: &mut Vec<(String, String)>) {
     do_command_substitution_for_dot(tokens);
